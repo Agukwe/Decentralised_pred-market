@@ -340,3 +340,143 @@
           price: (+ share-price (/ (* amount u1000000) (get total-value-locked market)))
         }
       )
+      ;; Update user's position
+      (map-set positions
+        { market-id: market-id, user: user }
+        {
+          outcomes-owned: (remove-shares-from-position (get outcomes-owned position) outcome-id shares-to-sell),
+          total-invested: (get total-invested position) ;; Keep track of total investment
+        }
+      )
+      
+      ;; Update market TVL
+      (map-set markets
+        { market-id: market-id }
+        (merge market { total-value-locked: (- (get total-value-locked market) net-payout) })
+      )
+      
+      ;; Pay fees
+      (try! (as-contract (stx-transfer? protocol-fee (as-contract tx-sender) (var-get treasury-address))))
+      (try! (as-contract (stx-transfer? fee-amount (as-contract tx-sender) (get creator market))))
+      
+      ;; Pay user
+      (try! (as-contract (stx-transfer? net-payout (as-contract tx-sender) user)))
+      
+      (ok { amount-received: net-payout })
+    )
+  )
+)
+
+;; Helper to get user's shares for a specific outcome
+(define-private (get-user-outcome-shares 
+  (outcomes (list 10 { outcome-id: uint, shares: uint }))
+  (outcome-id uint))
+  
+  (default-to u0 (get shares (find-outcome outcomes outcome-id)))
+)
+
+;; Helper to find outcome in a list
+(define-private (find-outcome
+  (outcomes (list 10 { outcome-id: uint, shares: uint }))
+  (outcome-id uint))
+  
+  (unwrap-panic 
+    (find outcome-matches outcomes)
+    { outcome-id: u0, shares: u0 }
+  )
+)
+
+;; Helper to check if outcome matches
+(define-private (outcome-matches (outcome { outcome-id: uint, shares: uint }))
+  (is-eq (get outcome-id outcome) outcome-id)
+)
+
+;; Helper to remove shares from position
+(define-private (remove-shares-from-position
+  (outcomes (list 10 { outcome-id: uint, shares: uint }))
+  (outcome-id uint)
+  (shares-to-remove uint))
+  
+  (let (
+    (position-index (unwrap-panic (find-outcome-position outcomes outcome-id u0)))
+    (current-position (unwrap-panic (element-at outcomes position-index)))
+    (current-shares (get shares current-position))
+  )
+    (if (> current-shares shares-to-remove)
+      ;; Update with remaining shares
+      (replace-at outcomes position-index { 
+        outcome-id: outcome-id, 
+        shares: (- current-shares shares-to-remove) 
+      })
+      ;; Remove the position entirely
+      (filter remove-outcome-by-id outcomes)
+    )
+  )
+)
+
+;; Helper to filter out an outcome
+(define-private (remove-outcome-by-id (outcome { outcome-id: uint, shares: uint }))
+  (not (is-eq (get outcome-id outcome) outcome-id))
+)
+
+;; Oracle resolution
+(define-public (resolve-market (market-id uint) (outcome-id uint))
+  (let (
+    (oracle tx-sender)
+    (market (unwrap! (map-get? markets { market-id: market-id }) err-market-not-found))
+  )
+    ;; Validate conditions
+    (asserts! (is-eq oracle (get oracle market)) err-not-authorized)
+    (asserts! (>= block-height (get closing-time market)) err-market-not-closed)
+    (asserts! (not (get resolved market)) err-market-resolved)
+    (asserts! (< outcome-id (len (get outcomes market))) err-invalid-outcome)
+    
+    ;; Set resolution outcome and start dispute period
+    (map-set markets
+      { market-id: market-id }
+      (merge market { 
+        resolution-outcome: (some outcome-id),
+        dispute-resolution-timestamp: (+ block-height (get dispute-period-length market))
+      })
+    )
+    
+    ;; Pay oracle fee
+    (try! (as-contract (stx-transfer? (get oracle-fee market) (as-contract tx-sender) oracle)))
+    
+    (ok true)
+  )
+)
+
+;; Dispute market resolution
+(define-public (dispute-resolution (market-id uint) (proposed-outcome uint) (stake-amount uint))
+  (let (
+    (disputer tx-sender)
+    (market (unwrap! (map-get? markets { market-id: market-id }) err-market-not-found))
+    (min-stake (var-get min-dispute-stake))
+  )
+    ;; Validate conditions
+    (asserts! (is-some (get resolution-outcome market)) err-market-not-resolving)
+    (asserts! (< block-height (get dispute-resolution-timestamp market)) err-dispute-period-ended)
+    (asserts! (>= stake-amount min-stake) err-invalid-dispute-stake)
+    (asserts! (< proposed-outcome (len (get outcomes market))) err-invalid-outcome)
+    (asserts! (not (is-eq proposed-outcome (unwrap-panic (get resolution-outcome market)))) err-invalid-outcome)
+    (asserts! (is-none (map-get? disputes { market-id: market-id, disputer: disputer })) err-dispute-exists)
+    
+    ;; Transfer stake from disputer
+    (try! (stx-transfer? stake-amount disputer (as-contract tx-sender)))
+    
+    ;; Record dispute
+    (map-set disputes
+      { market-id: market-id, disputer: disputer }
+      {
+        proposed-outcome: proposed-outcome,
+        stake-amount: stake-amount,
+        dispute-time: block-height,
+        resolved: false,
+        won: false
+      }
+    )
+    
+    (ok true)
+  )
+)
