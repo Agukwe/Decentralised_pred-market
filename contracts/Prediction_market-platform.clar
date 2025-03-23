@@ -249,3 +249,94 @@
     )
   )
 )
+;; Helper to add or update a liquidity provider
+(define-private (add-or-update-provider 
+  (providers (list 50 { provider: principal, amount: uint, share-percentage: uint }))
+  (user principal)
+  (amount uint)
+  (share-pct uint))
+  
+  (let ((provider-index (find-provider-index providers user u0)))
+    (if (is-some provider-index)
+      ;; Update existing provider
+      (update-provider-at-index providers (unwrap-panic provider-index) user amount share-pct)
+      ;; Add new provider
+      (append providers { provider: user, amount: amount, share-percentage: share-pct })
+    )
+  )
+)
+
+;; Find a provider's index in the list
+(define-private (find-provider-index 
+  (providers (list 50 { provider: principal, amount: uint, share-percentage: uint }))
+  (user principal)
+  (current-index uint))
+  
+  (if (>= current-index (len providers))
+    none
+    (if (is-eq user (get provider (unwrap-panic (element-at providers current-index))))
+      (some current-index)
+      (find-provider-index providers user (+ current-index u1))
+    )
+  )
+)
+
+;; Update a provider at a specific index
+(define-private (update-provider-at-index
+  (providers (list 50 { provider: principal, amount: uint, share-percentage: uint }))
+  (index uint)
+  (user principal)
+  (new-amount uint)
+  (new-share-pct uint))
+  
+  (let (
+    (current-provider (unwrap-panic (element-at providers index)))
+    (current-amount (get amount current-provider))
+    (updated-provider {
+      provider: user,
+      amount: (+ current-amount new-amount),
+      share-percentage: new-share-pct
+    })
+  )
+    (replace-at providers index updated-provider)
+  )
+)
+
+;; Buy shares of a specific outcome
+(define-public (buy-shares (market-id uint) (outcome-id uint) (amount uint))
+  (let (
+    (user tx-sender)
+    (market (unwrap! (map-get? markets { market-id: market-id }) err-market-not-found))
+    (shares (unwrap! (map-get? outcome-shares { market-id: market-id, outcome-id: outcome-id }) err-invalid-outcome))
+    (position (default-to {
+      outcomes-owned: (list),
+      total-invested: u0
+    } (map-get? positions { market-id: market-id, user: user })))
+  )
+    ;; Validate conditions
+    (asserts! (< block-height (get closing-time market)) err-market-closed)
+    (asserts! (not (get resolved market)) err-market-resolved)
+    (asserts! (>= amount (get min-trade-amount market)) err-invalid-parameters)
+    (asserts! (< outcome-id (len (get outcomes market))) err-invalid-outcome)
+    
+    ;; Transfer STX from user
+    (try! (stx-transfer? amount user (as-contract tx-sender)))
+    
+    ;; Calculate shares to mint (simple linear formula for now)
+    ;; In a production system, this would use a more sophisticated AMM algorithm
+    (let (
+      (share-price (get price shares))
+      (shares-to-mint (/ (* amount u100000000) share-price))
+      (fee-amount (/ (* amount (get fee-percentage market)) u10000))
+      (protocol-fee (/ (* amount (var-get protocol-fee-percentage)) u10000))
+      (net-amount (- amount (+ fee-amount protocol-fee)))
+    )
+      ;; Update shares data
+      (map-set outcome-shares
+        { market-id: market-id, outcome-id: outcome-id }
+        {
+          total-shares: (+ (get total-shares shares) shares-to-mint),
+          ;; Simple price impact - price increases as more shares are bought
+          price: (+ share-price (/ (* amount u1000000) (get total-value-locked market)))
+        }
+      )
