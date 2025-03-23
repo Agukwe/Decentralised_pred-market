@@ -480,3 +480,165 @@
     (ok true)
   )
 )
+;; Finalize market after dispute period
+(define-public (finalize-market (market-id uint))
+  (let (
+    (market (unwrap! (map-get? markets { market-id: market-id }) err-market-not-found))
+  )
+    ;; Validate conditions
+    (asserts! (is-some (get resolution-outcome market)) err-market-not-resolving)
+    (asserts! (>= block-height (get dispute-resolution-timestamp market)) err-dispute-period-active)
+    (asserts! (not (get resolved market)) err-market-resolved)
+    
+    ;; Finalize market
+    (map-set markets
+      { market-id: market-id }
+      (merge market { resolved: true })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Claim winnings after market is resolved
+(define-public (claim-winnings (market-id uint))
+  (let (
+    (user tx-sender)
+    (market (unwrap! (map-get? markets { market-id: market-id }) err-market-not-found))
+    (position (unwrap! (map-get? positions { market-id: market-id, user: user }) err-position-not-found))
+  )
+    ;; Validate conditions
+    (asserts! (get resolved market) err-market-not-resolved)
+    (asserts! (is-some (get resolution-outcome market)) err-market-not-resolved)
+    
+    (let (
+      (winning-outcome (unwrap-panic (get resolution-outcome market)))
+      (user-shares (get-user-outcome-shares (get outcomes-owned position) winning-outcome))
+      (total-shares (get total-shares (unwrap-panic (map-get? outcome-shares { market-id: market-id, outcome-id: winning-outcome }))))
+      (tvl (get total-value-locked market))
+    )
+      ;; Only winners can claim
+      (asserts! (> user-shares u0) err-shares-not-found)
+      
+      ;; Calculate winnings proportionally to shares owned
+      (let (
+        (winnings (/ (* tvl user-shares) total-shares))
+      )
+        ;; Pay winnings
+        (try! (as-contract (stx-transfer? winnings (as-contract tx-sender) user)))
+        
+        ;; Clear position
+        (map-delete positions { market-id: market-id, user: user })
+        
+        (ok { amount-claimed: winnings })
+      )
+    )
+  )
+)
+
+;; Remove liquidity after market is resolved
+(define-public (remove-liquidity (market-id uint))
+  (let (
+    (user tx-sender)
+    (market (unwrap! (map-get? markets { market-id: market-id }) err-market-not-found))
+    (liquidity-pool (unwrap! (map-get? liquidity-pools { market-id: market-id }) err-market-not-found))
+    (provider-index (unwrap! (find-provider-index (get liquidity-providers liquidity-pool) user u0) err-not-authorized))
+  )
+    ;; Validate conditions
+    (asserts! (get resolved market) err-market-not-resolved)
+    
+    (let (
+      (provider-data (unwrap-panic (element-at (get liquidity-providers liquidity-pool) provider-index)))
+      (share-percentage (get share-percentage provider-data))
+      (remaining-tvl (get total-value-locked market))
+      (amount-to-return (/ (* remaining-tvl share-percentage) u10000))
+    )
+      ;; Pay liquidity provider
+      (try! (as-contract (stx-transfer? amount-to-return (as-contract tx-sender) user)))
+      
+      ;; Update liquidity pool by removing the provider
+      (map-set liquidity-pools
+        { market-id: market-id }
+        {
+          total-liquidity: (- (get total-liquidity liquidity-pool) amount-to-return),
+          liquidity-providers: (filter remove-provider-by-principal (get liquidity-providers liquidity-pool))
+        }
+      )
+      
+      ;; Update market TVL
+      (map-set markets
+        { market-id: market-id }
+        (merge market { total-value-locked: (- remaining-tvl amount-to-return) })
+      )
+      
+      (ok { amount-returned: amount-to-return })
+    )
+  )
+)
+
+;; Helper to filter out a provider by principal
+(define-private (remove-provider-by-principal (provider { provider: principal, amount: uint, share-percentage: uint }))
+  (not (is-eq (get provider provider) tx-sender))
+)
+
+;; Governance functions
+
+;; Add a new oracle
+(define-public (add-oracle (oracle principal))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (map-set authorized-oracles 
+      { oracle: oracle } 
+      { authorized: true, reputation-score: u100 }
+    )
+    (ok true)
+  )
+)
+
+;; Remove an oracle
+(define-public (remove-oracle (oracle principal))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (map-delete authorized-oracles { oracle: oracle })
+    (ok true)
+  )
+)
+
+;; Update oracle reputation
+(define-public (update-oracle-reputation (oracle principal) (new-score uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (<= new-score u100) err-invalid-parameters)
+    
+    (let ((oracle-data (unwrap! (map-get? authorized-oracles { oracle: oracle }) err-unauthorized-oracle)))
+      (map-set authorized-oracles
+        { oracle: oracle }
+        (merge oracle-data { reputation-score: new-score })
+      )
+      (ok true)
+    )
+  )
+)
+
+;; Update minimum dispute stake
+(define-public (set-min-dispute-stake (new-stake uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (var-set min-dispute-stake new-stake)
+    (ok true)
+  )
+)
+
+;; Update default dispute period length
+(define-public (set-default-dispute-period-length (new-length uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (var-set default-dispute-period-length new-length)
+    (ok true)
+  )
+)
+
+;; Update protocol fee percentage
+(define-public (set-protocol-fee-percentage (new-percentage uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
