@@ -114,3 +114,138 @@
     (ok true)
   )
 )
+;; Add a new oracle
+(define-private (register-oracle (oracle principal))
+  (map-set authorized-oracles 
+    { oracle: oracle } 
+    { authorized: true, reputation-score: u100 }
+  )
+)
+
+;; Create a new prediction market
+(define-public (create-market 
+  (description (string-utf8 256))
+  (category (string-ascii 32))
+  (outcomes (list 10 (string-utf8 64)))
+  (resolution-time uint)
+  (closing-time uint)
+  (fee-percentage uint)
+  (oracle principal)
+  (oracle-fee uint)
+  (min-trade-amount uint)
+  (additional-data (optional (string-utf8 256))))
+  
+  (let (
+    (market-id (var-get next-market-id))
+    (creator tx-sender)
+    (dispute-period-length (var-get default-dispute-period-length))
+  )
+    ;; Validate parameters
+    (asserts! (> (len outcomes) u1) err-invalid-parameters) ;; At least 2 outcomes
+    (asserts! (< fee-percentage u1000) err-invalid-parameters) ;; Max 10% fee
+    (asserts! (>= resolution-time closing-time) err-invalid-parameters) ;; Resolution must be after closing
+    (asserts! (> closing-time block-height) err-invalid-parameters) ;; Closing must be in the future
+    (asserts! (default-to false (get authorized (map-get? authorized-oracles { oracle: oracle }))) err-unauthorized-oracle)
+    
+    ;; Charge market creation fee (fixed at 10 STX for now)
+    (try! (stx-transfer? u10000000 creator contract-owner))
+    
+    ;; Create the market
+    (map-set markets
+      { market-id: market-id }
+      {
+        creator: creator,
+        description: description,
+        category: category,
+        outcomes: outcomes,
+        creation-time: block-height,
+        resolution-time: resolution-time,
+        closing-time: closing-time,
+        total-value-locked: u0,
+        fee-percentage: fee-percentage,
+        resolved: false,
+        resolution-outcome: none,
+        oracle: oracle,
+        oracle-fee: oracle-fee,
+        dispute-period-length: dispute-period-length,
+        dispute-resolution-timestamp: u0,
+        min-trade-amount: min-trade-amount,
+        additional-data: additional-data
+      }
+    )
+    
+    ;; Initialize outcome shares
+    (initialize-outcome-shares market-id outcomes)
+    
+    ;; Increment market ID
+    (var-set next-market-id (+ market-id u1))
+    
+    (ok market-id)
+  )
+)
+
+;; Helper to initialize outcome shares
+(define-private (initialize-outcome-shares (market-id uint) (outcomes (list 10 (string-utf8 64))))
+  (let ((outcome-count (len outcomes)))
+    (map-outcome-initializer market-id u0 outcome-count)
+  )
+)
+
+;; Helper for outcome initialization
+(define-private (map-outcome-initializer (market-id uint) (current-id uint) (max-id uint))
+  (if (>= current-id max-id)
+    true
+    (begin
+      (map-set outcome-shares
+        { market-id: market-id, outcome-id: current-id }
+        { total-shares: u0, price: u50000000 } ;; Initial price at 50%
+      )
+      (map-outcome-initializer market-id (+ current-id u1) max-id)
+    )
+  )
+)
+
+;; Add liquidity to the market
+(define-public (add-liquidity (market-id uint) (amount uint))
+  (let (
+    (user tx-sender)
+    (market (unwrap! (map-get? markets { market-id: market-id }) err-market-not-found))
+    (liquidity-pool (default-to { 
+      total-liquidity: u0, 
+      liquidity-providers: (list) 
+    } (map-get? liquidity-pools { market-id: market-id })))
+    (current-total (get total-liquidity liquidity-pool))
+    (current-providers (get liquidity-providers liquidity-pool))
+  )
+    ;; Ensure market isn't closed
+    (asserts! (< block-height (get closing-time market)) err-market-closed)
+    
+    ;; Transfer STX from user to contract
+    (try! (stx-transfer? amount user (as-contract tx-sender)))
+    
+    ;; Update liquidity pool
+    (let (
+      (new-total (+ current-total amount))
+      (provider-share-pct (if (is-eq current-total u0)
+                             u10000 ;; First provider gets 100%
+                             (/ (* amount u10000) new-total))) ;; Calculate share percentage
+      (updated-providers (add-or-update-provider current-providers user amount provider-share-pct))
+    )
+      (map-set liquidity-pools
+        { market-id: market-id }
+        {
+          total-liquidity: new-total,
+          liquidity-providers: updated-providers
+        }
+      )
+      
+      ;; Update market TVL
+      (map-set markets
+        { market-id: market-id }
+        (merge market { total-value-locked: (+ (get total-value-locked market) amount) })
+      )
+      
+      (ok { share-percentage: provider-share-pct })
+    )
+  )
+)
