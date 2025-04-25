@@ -300,3 +300,544 @@ Clarinet.test({
           oracle.address
         )
       ]);
+        // Check resolution succeeded
+    assertEquals(block.receipts[0].result, '(ok true)');
+},
+});
+
+Clarinet.test({
+name: "Dispute market resolution",
+async fn(chain: Chain, accounts: Map<string, Account>) {
+  const deployer = accounts.get('deployer')!;
+  const oracle = accounts.get('wallet_1')!;
+  const marketCreator = accounts.get('wallet_2')!;
+  const liquidityProvider = accounts.get('wallet_3')!;
+  const disputer = accounts.get('wallet_4')!;
+  
+  // Setup and resolve market
+  chain.mineBlock([
+    // Initialize contract
+    Tx.contractCall(
+      'prediction-market', 
+      'initialize', 
+      [types.list([types.principal(oracle.address)])], 
+      deployer.address
+    ),
+    
+    // Create market with short timeframe
+    Tx.contractCall(
+      'prediction-market', 
+      'create-market', 
+      [
+        types.utf8("Will BTC price exceed $100k by end of 2025?"), // description
+        types.ascii("crypto"), // category
+        types.list([types.utf8("Yes"), types.utf8("No")]), // outcomes
+        types.uint(chain.blockHeight + 10), // resolution time
+        types.uint(chain.blockHeight + 5), // closing time (soon)
+        types.uint(250), // fee percentage (2.5%)
+        types.principal(oracle.address), // oracle
+        types.uint(10000000), // oracle fee (10 STX)
+        types.uint(1000000), // min trade amount (1 STX)
+        types.some(types.utf8("Additional market info")) // additional data
+      ], 
+      marketCreator.address
+    ),
+    
+    // Add liquidity
+    Tx.contractCall(
+      'prediction-market', 
+      'add-liquidity', 
+      [
+        types.uint(1), // market ID
+        types.uint(100000000) // amount (100 STX)
+      ], 
+      liquidityProvider.address
+    )
+  ]);
+  
+  // Mine blocks to reach closing time
+  for (let i = 0; i < 6; i++) {
+    chain.mineBlock([]);
+  }
+  
+  // Oracle resolves the market (outcome 1 = "No")
+  chain.mineBlock([
+    Tx.contractCall(
+      'prediction-market', 
+      'resolve-market', 
+      [
+        types.uint(1), // market ID
+        types.uint(1)  // outcome ID (No)
+      ], 
+      oracle.address
+    )
+  ]);
+  
+  // User disputes the resolution (proposes outcome 0 = "Yes")
+  let block = chain.mineBlock([
+    Tx.contractCall(
+      'prediction-market', 
+      'dispute-resolution', 
+      [
+        types.uint(1), // market ID
+        types.uint(0), // proposed outcome ID (Yes)
+        types.uint(2000000) // stake amount (2 STX)
+      ], 
+      disputer.address
+    )
+  ]);
+  
+  // Check dispute succeeded
+  assertEquals(block.receipts[0].result, '(ok true)');
+},
+});
+
+Clarinet.test({
+name: "Finalize market after dispute period",
+async fn(chain: Chain, accounts: Map<string, Account>) {
+  const deployer = accounts.get('deployer')!;
+  const oracle = accounts.get('wallet_1')!;
+  const marketCreator = accounts.get('wallet_2')!;
+  const finalizer = accounts.get('wallet_3')!;
+  
+  // Setup and resolve market
+  let setupBlock = chain.mineBlock([
+    // Initialize contract
+    Tx.contractCall(
+      'prediction-market', 
+      'initialize', 
+      [types.list([types.principal(oracle.address)])], 
+      deployer.address
+    ),
+    
+    // Set shorter dispute period for testing
+    Tx.contractCall(
+      'prediction-market',
+      'set-default-dispute-period-length',
+      [types.uint(5)], // 5 blocks dispute period
+      deployer.address
+    ),
+    
+    // Create market with short timeframe
+    Tx.contractCall(
+      'prediction-market', 
+      'create-market', 
+      [
+        types.utf8("Will BTC price exceed $100k by end of 2025?"), // description
+        types.ascii("crypto"), // category
+        types.list([types.utf8("Yes"), types.utf8("No")]), // outcomes
+        types.uint(chain.blockHeight + 10), // resolution time
+        types.uint(chain.blockHeight + 5), // closing time (soon)
+        types.uint(250), // fee percentage (2.5%)
+        types.principal(oracle.address), // oracle
+        types.uint(10000000), // oracle fee (10 STX)
+        types.uint(1000000), // min trade amount (1 STX)
+        types.some(types.utf8("Additional market info")) // additional data
+      ], 
+      marketCreator.address
+    )
+  ]);
+  
+  // Mine blocks to reach closing time
+  for (let i = 0; i < 6; i++) {
+    chain.mineBlock([]);
+  }
+  
+  // Oracle resolves the market
+  chain.mineBlock([
+    Tx.contractCall(
+      'prediction-market', 
+      'resolve-market', 
+      [
+        types.uint(1), // market ID
+        types.uint(1)  // outcome ID (No)
+      ], 
+      oracle.address
+    )
+  ]);
+  
+  // Mine blocks to exceed dispute period
+  for (let i = 0; i < 6; i++) {
+    chain.mineBlock([]);
+  }
+  
+  // Finalize the market
+  let block = chain.mineBlock([
+    Tx.contractCall(
+      'prediction-market', 
+      'finalize-market', 
+      [types.uint(1)], // market ID
+      finalizer.address
+    )
+  ]);
+  
+  // Check finalization succeeded
+  assertEquals(block.receipts[0].result, '(ok true)');
+},
+});
+
+Clarinet.test({
+name: "Claim winnings after market resolution",
+async fn(chain: Chain, accounts: Map<string, Account>) {
+  const deployer = accounts.get('deployer')!;
+  const oracle = accounts.get('wallet_1')!;
+  const marketCreator = accounts.get('wallet_2')!;
+  const liquidityProvider = accounts.get('wallet_3')!;
+  const trader = accounts.get('wallet_4')!;
+  const finalizer = accounts.get('wallet_5')!;
+  
+  // Setup market with liquidity
+  chain.mineBlock([
+    // Initialize contract
+    Tx.contractCall(
+      'prediction-market', 
+      'initialize', 
+      [types.list([types.principal(oracle.address)])], 
+      deployer.address
+    ),
+    
+    // Set shorter dispute period for testing
+    Tx.contractCall(
+      'prediction-market',
+      'set-default-dispute-period-length',
+      [types.uint(5)], // 5 blocks dispute period
+      deployer.address
+    ),
+    
+    // Create market
+    Tx.contractCall(
+      'prediction-market', 
+      'create-market', 
+      [
+        types.utf8("Will BTC price exceed $100k by end of 2025?"), // description
+        types.ascii("crypto"), // category
+        types.list([types.utf8("Yes"), types.utf8("No")]), // outcomes
+        types.uint(chain.blockHeight + 20), // resolution time
+        types.uint(chain.blockHeight + 15), // closing time
+        types.uint(250), // fee percentage (2.5%)
+        types.principal(oracle.address), // oracle
+        types.uint(10000000), // oracle fee (10 STX)
+        types.uint(1000000), // min trade amount (1 STX)
+        types.some(types.utf8("Additional market info")) // additional data
+      ], 
+      marketCreator.address
+    ),
+    
+    // Add liquidity
+    Tx.contractCall(
+      'prediction-market', 
+      'add-liquidity', 
+      [
+        types.uint(1), // market ID
+        types.uint(100000000) // amount (100 STX)
+      ], 
+      liquidityProvider.address
+    )
+  ]);
+  
+  // Trader buys shares in outcome 1 ("No")
+  chain.mineBlock([
+    Tx.contractCall(
+      'prediction-market', 
+      'buy-shares', 
+      [
+        types.uint(1), // market ID
+        types.uint(1), // outcome ID (No)
+        types.uint(10000000) // amount (10 STX)
+      ], 
+      trader.address
+    )
+  ]);
+  
+  // Mine blocks to reach closing time
+  for (let i = 0; i < 16; i++) {
+    chain.mineBlock([]);
+  }
+  
+  // Oracle resolves the market (outcome 1 = "No" - the trader's position)
+  chain.mineBlock([
+    Tx.contractCall(
+      'prediction-market', 
+      'resolve-market', 
+      [
+        types.uint(1), // market ID
+        types.uint(1)  // outcome ID (No)
+      ], 
+      oracle.address
+    )
+  ]);
+  
+  // Mine blocks to exceed dispute period
+  for (let i = 0; i < 6; i++) {
+    chain.mineBlock([]);
+  }
+    // Finalize the market
+    chain.mineBlock([
+        Tx.contractCall(
+          'prediction-market', 
+          'finalize-market', 
+          [types.uint(1)], // market ID
+          finalizer.address
+        )
+      ]);
+      
+      // Trader claims winnings
+      let block = chain.mineBlock([
+        Tx.contractCall(
+          'prediction-market', 
+          'claim-winnings', 
+          [types.uint(1)], // market ID
+          trader.address
+        )
+      ]);
+      
+      // Check claim succeeded
+      // We can't easily predict the exact amount since it depends on the price impact
+      // implementation details, but we can check it returns an ok result
+      const result = block.receipts[0].result;
+      assertTrue(result.startsWith('(ok '));
+    },
+  });
+  
+  Clarinet.test({
+    name: "Remove liquidity after market resolution",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+      const deployer = accounts.get('deployer')!;
+      const oracle = accounts.get('wallet_1')!;
+      const marketCreator = accounts.get('wallet_2')!;
+      const liquidityProvider = accounts.get('wallet_3')!;
+      const finalizer = accounts.get('wallet_4')!;
+      
+      // Setup market with liquidity
+      chain.mineBlock([
+        // Initialize contract
+        Tx.contractCall(
+          'prediction-market', 
+          'initialize', 
+          [types.list([types.principal(oracle.address)])], 
+          deployer.address
+        ),
+        
+        // Set shorter dispute period for testing
+        Tx.contractCall(
+          'prediction-market',
+          'set-default-dispute-period-length',
+          [types.uint(5)], // 5 blocks dispute period
+          deployer.address
+        ),
+        
+        // Create market with short timeframe
+        Tx.contractCall(
+          'prediction-market', 
+          'create-market', 
+          [
+            types.utf8("Will BTC price exceed $100k by end of 2025?"), // description
+            types.ascii("crypto"), // category
+            types.list([types.utf8("Yes"), types.utf8("No")]), // outcomes
+            types.uint(chain.blockHeight + 15), // resolution time
+            types.uint(chain.blockHeight + 10), // closing time
+            types.uint(250), // fee percentage (2.5%)
+            types.principal(oracle.address), // oracle
+            types.uint(10000000), // oracle fee (10 STX)
+            types.uint(1000000), // min trade amount (1 STX)
+            types.some(types.utf8("Additional market info")) // additional data
+          ], 
+          marketCreator.address
+        ),
+        
+        // Add liquidity
+        Tx.contractCall(
+          'prediction-market', 
+          'add-liquidity', 
+          [
+            types.uint(1), // market ID
+            types.uint(100000000) // amount (100 STX)
+          ], 
+          liquidityProvider.address
+        )
+      ]);
+      
+      // Mine blocks to reach closing time
+      for (let i = 0; i < 11; i++) {
+        chain.mineBlock([]);
+      }
+      
+      // Oracle resolves the market
+      chain.mineBlock([
+        Tx.contractCall(
+          'prediction-market', 
+          'resolve-market', 
+          [
+            types.uint(1), // market ID
+            types.uint(1)  // outcome ID (No)
+          ], 
+          oracle.address
+        )
+      ]);
+      
+      // Mine blocks to exceed dispute period
+      for (let i = 0; i < 6; i++) {
+        chain.mineBlock([]);
+      }
+      
+      // Finalize the market
+      chain.mineBlock([
+        Tx.contractCall(
+          'prediction-market', 
+          'finalize-market', 
+          [types.uint(1)], // market ID
+          finalizer.address
+        )
+      ]);
+      
+      // Liquidity provider removes liquidity
+      let block = chain.mineBlock([
+        Tx.contractCall(
+          'prediction-market', 
+          'remove-liquidity', 
+          [types.uint(1)], // market ID
+          liquidityProvider.address
+        )
+      ]);
+      
+      // Check liquidity removal succeeded
+      assertTrue(block.receipts[0].result.startsWith('(ok '));
+    },
+  });
+  
+  Clarinet.test({
+    name: "Governance functions work correctly",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+      const deployer = accounts.get('deployer')!;
+      const newOracle = accounts.get('wallet_1')!;
+      const nonOwner = accounts.get('wallet_2')!;
+      
+      // Test adding a new oracle
+      let block1 = chain.mineBlock([
+        Tx.contractCall(
+          'prediction-market', 
+          'add-oracle', 
+          [types.principal(newOracle.address)], 
+          deployer.address
+        )
+      ]);
+      
+      // Test updating oracle reputation
+      let block2 = chain.mineBlock([
+        Tx.contractCall(
+          'prediction-market', 
+          'update-oracle-reputation', 
+          [
+            types.principal(newOracle.address),
+            types.uint(90) // 90% reputation
+          ], 
+          deployer.address
+        )
+      ]);
+      
+      // Test updating minimum dispute stake
+      let block3 = chain.mineBlock([
+        Tx.contractCall(
+          'prediction-market', 
+          'set-min-dispute-stake', 
+          [types.uint(2000000)], // 2 STX
+          deployer.address
+        )
+      ]);
+      
+      // Test non-owner cannot call governance functions
+      let block4 = chain.mineBlock([
+        Tx.contractCall(
+          'prediction-market', 
+          'set-protocol-fee-percentage', 
+          [types.uint(200)], // 2%
+          nonOwner.address
+        )
+      ]);
+      
+      // Check results
+      assertEquals(block1.receipts[0].result, '(ok true)');
+      assertEquals(block2.receipts[0].result, '(ok true)');
+      assertEquals(block3.receipts[0].result, '(ok true)');
+      assertEquals(getErrCode(block4.receipts[0]), 100); // err-owner-only
+    },
+  });
+  
+  Clarinet.test({
+    name: "Cannot buy shares after market closes",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+      const deployer = accounts.get('deployer')!;
+      const oracle = accounts.get('wallet_1')!;
+      const marketCreator = accounts.get('wallet_2')!;
+      const liquidityProvider = accounts.get('wallet_3')!;
+      const trader = accounts.get('wallet_4')!;
+      
+      // Setup market with liquidity
+      chain.mineBlock([
+        // Initialize contract
+        Tx.contractCall(
+          'prediction-market', 
+          'initialize', 
+          [types.list([types.principal(oracle.address)])], 
+          deployer.address
+        ),
+        
+        // Create market with short timeframe
+        Tx.contractCall(
+          'prediction-market', 
+          'create-market', 
+          [
+            types.utf8("Will BTC price exceed $100k by end of 2025?"), // description
+            types.ascii("crypto"), // category
+            types.list([types.utf8("Yes"), types.utf8("No")]), // outcomes
+            types.uint(chain.blockHeight + 15), // resolution time
+            types.uint(chain.blockHeight + 5), // closing time (very soon)
+            types.uint(250), // fee percentage (2.5%)
+            types.principal(oracle.address), // oracle
+            types.uint(10000000), // oracle fee (10 STX)
+            types.uint(1000000), // min trade amount (1 STX)
+            types.some(types.utf8("Additional market info")) // additional data
+          ], 
+          marketCreator.address
+        ),
+        
+        // Add liquidity
+        Tx.contractCall(
+          'prediction-market', 
+          'add-liquidity', 
+          [
+            types.uint(1), // market ID
+            types.uint(100000000) // amount (100 STX)
+          ], 
+          liquidityProvider.address
+        )
+      ]);
+      
+      // Mine blocks to pass closing time
+      for (let i = 0; i < 6; i++) {
+        chain.mineBlock([]);
+      }
+      
+      // Try to buy shares after market close
+      let block = chain.mineBlock([
+        Tx.contractCall(
+          'prediction-market', 
+          'buy-shares', 
+          [
+            types.uint(1), // market ID
+            types.uint(0), // outcome ID (Yes)
+            types.uint(10000000) // amount (10 STX)
+          ], 
+          trader.address
+        )
+      ]);
+      
+      // Check it failed with market closed error
+      assertEquals(getErrCode(block.receipts[0]), 105); // err-market-closed
+    },
+  });
+  
+  // Helper function to check if a result starts with a prefix
+  function assertTrue(condition: boolean) {
+    assertEquals(condition, true);
+  }
