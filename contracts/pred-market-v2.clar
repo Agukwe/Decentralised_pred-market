@@ -258,7 +258,7 @@
         category: "general",
         description: "Simple Yes/No prediction market",
         market-type: market-type-binary,
-        default-outcomes: (list "Yes" "No"),
+        default-outcomes: (list u"Yes" u"No"),
         default-duration: u1008, ;; ~7 days
         suggested-fee: u100, ;; 1%
         risk-level: u1,
@@ -275,7 +275,7 @@
         category: "crypto",
         description: "Cryptocurrency price movements",
         market-type: market-type-categorical,
-        default-outcomes: (list "Below $X" "$X to $Y" "Above $Y"),
+        default-outcomes: (list u"Below $X" u"$X to $Y" u"Above $Y"),
         default-duration: u4032, ;; ~1 month
         suggested-fee: u150, ;; 1.5%
         risk-level: u2,
@@ -292,7 +292,7 @@
         category: "sports",
         description: "Sports match outcome prediction",
         market-type: market-type-categorical,
-        default-outcomes: (list "Team A Wins" "Draw" "Team B Wins"),
+        default-outcomes: (list u"Team A Wins" u"Draw" u"Team B Wins"),
         default-duration: u144, ;; ~1 day
         suggested-fee: u200, ;; 2%
         risk-level: u1,
@@ -419,5 +419,452 @@
     (duration-factor (/ duration u1008)) ;; Per week factor
   )
     (+ base-fee (* type-multiplier (* duration-factor u1000000)))
+  )
+)
+
+;; ===== COMMIT 2: ADVANCED AMM PRICING AND AUTOMATED MARKET MAKERS =====
+
+;; Advanced liquidity provision with AMM
+(define-public (provide-liquidity
+  (market-id uint)
+  (amount uint)
+  (min-liquidity-tokens uint)
+  (lock-duration uint))
+  
+  (let (
+    (provider tx-sender)
+    (market (unwrap! (map-get? markets-v2 { market-id: market-id }) err-market-not-found))
+    (amm-pool (unwrap! (map-get? amm-pools { market-id: market-id }) err-market-not-found))
+    (current-supply (get liquidity-token-supply amm-pool))
+    (total-liquidity (get total-liquidity market))
+  )
+    ;; Validate market is active and supports AMM
+    (asserts! (is-eq (get status market) u0) err-market-closed)
+    (asserts! (> amount u0) err-invalid-parameters)
+    (asserts! (<= lock-duration u26280) err-invalid-parameters) ;; Max 6 months lock
+    
+    ;; Transfer collateral from provider
+    (try! (transfer-collateral amount provider (as-contract tx-sender) (get collateral-token market)))
+    
+    ;; Calculate liquidity tokens to mint
+    (let (
+      (liquidity-tokens (if (is-eq current-supply u0)
+                           ;; First liquidity provider gets 1:1 ratio
+                           amount
+                           ;; Subsequent providers get proportional tokens
+                           (/ (* amount current-supply) total-liquidity)))
+      (lock-end-time (+ block-height lock-duration))
+    )
+      ;; Ensure minimum liquidity tokens met
+      (asserts! (>= liquidity-tokens min-liquidity-tokens) err-insufficient-funds)
+      
+      ;; Update AMM pool
+      (map-set amm-pools
+        { market-id: market-id }
+        (merge amm-pool {
+          liquidity-token-supply: (+ current-supply liquidity-tokens),
+          k-constant: (calculate-k-constant market-id (+ total-liquidity amount))
+        })
+      )
+      
+      ;; Update market liquidity
+      (map-set markets-v2
+        { market-id: market-id }
+        (merge market { total-liquidity: (+ total-liquidity amount) })
+      )
+      
+      ;; Record LP position
+      (map-set lp-positions
+        { market-id: market-id, provider: provider }
+        {
+          liquidity-tokens: (+ 
+            (default-to u0 (get liquidity-tokens (map-get? lp-positions { market-id: market-id, provider: provider })))
+            liquidity-tokens),
+          initial-deposit: (+ 
+            (default-to u0 (get initial-deposit (map-get? lp-positions { market-id: market-id, provider: provider })))
+            amount),
+          fees-earned: (default-to u0 (get fees-earned (map-get? lp-positions { market-id: market-id, provider: provider }))),
+          entry-time: block-height,
+          lock-end-time: lock-end-time
+        }
+      )
+      
+      (ok { liquidity-tokens: liquidity-tokens })
+    )
+  )
+)
+
+;; Calculate k-constant for AMM (simplified constant product)
+(define-private (calculate-k-constant (market-id uint) (total-liquidity uint))
+  ;; For simplicity, using square of total liquidity as k-constant
+  ;; In production, this would be more sophisticated based on outcome probabilities
+  (* total-liquidity total-liquidity)
+)
+
+;; Advanced trading with AMM pricing
+(define-public (trade-with-amm
+  (market-id uint)
+  (outcome-id uint)
+  (trade-type uint) ;; 0=buy, 1=sell
+  (amount uint)
+  (min-shares uint)
+  (max-slippage uint)) ;; In basis points (e.g., 500 = 5%)
+  
+  (let (
+    (trader tx-sender)
+    (market (unwrap! (map-get? markets-v2 { market-id: market-id }) err-market-not-found))
+    (amm-pool (unwrap! (map-get? amm-pools { market-id: market-id }) err-market-not-found))
+    (position (default-to {
+      shares-owned: (list),
+      total-invested: u0,
+      realized-pnl: 0,
+      unrealized-pnl: 0,
+      entry-timestamp: block-height,
+      last-trade-timestamp: block-height,
+      margin-posted: u0
+    } (map-get? positions-v2 { market-id: market-id, user: trader })))
+  )
+    ;; Validate trading conditions
+    (asserts! (is-eq (get status market) u0) err-market-closed)
+    (asserts! (< block-height (get trading-end-time market)) err-market-closed)
+    (asserts! (< outcome-id (len (get outcomes market))) err-invalid-outcome)
+    (asserts! (> amount u0) err-invalid-parameters)
+    
+    ;; Check position limits
+    (let ((current-position-size (get-total-position-size trader market-id)))
+      (asserts! (<= (+ current-position-size amount) (get max-position-size market)) err-position-limit-exceeded)
+    )
+    
+    ;; Calculate AMM price and slippage
+    (let (
+      (current-price (calculate-amm-price market-id outcome-id))
+      (price-impact (calculate-price-impact market-id outcome-id amount trade-type))
+      (effective-price (if (is-eq trade-type u0)
+                          (+ current-price price-impact) ;; Buy price increases
+                          (- current-price price-impact))) ;; Sell price decreases
+      (slippage-pct (if (> current-price u0)
+                       (/ (* (abs-diff effective-price current-price) u10000) current-price)
+                       u0))
+    )
+      ;; Check slippage tolerance
+      (asserts! (<= slippage-pct max-slippage) err-invalid-parameters)
+      
+      (if (is-eq trade-type u0)
+        ;; BUY ORDER
+        (let (
+          (shares-to-receive (/ (* amount u1000000) effective-price))
+          (fee-amount (/ (* amount (get creator-fee market)) u10000))
+          (protocol-fee (/ (* amount (var-get base-trading-fee)) u10000))
+          (net-amount (- amount (+ fee-amount protocol-fee)))
+        )
+          ;; Ensure minimum shares received
+          (asserts! (>= shares-to-receive min-shares) err-insufficient-funds)
+          
+          ;; Transfer collateral from trader
+          (try! (transfer-collateral amount trader (as-contract tx-sender) (get collateral-token market)))
+          
+          ;; Update position
+          (map-set positions-v2
+            { market-id: market-id, user: trader }
+            (merge position {
+              shares-owned: (add-shares-to-position (get shares-owned position) outcome-id shares-to-receive effective-price),
+              total-invested: (+ (get total-invested position) net-amount),
+              last-trade-timestamp: block-height
+            })
+          )
+          
+          ;; Update market volume and metrics
+          (try! (update-market-metrics market-id amount))
+          
+          ;; Distribute fees
+          (try! (distribute-trading-fees market-id fee-amount protocol-fee))
+          
+          (ok { shares-received: shares-to-receive, effective-price: effective-price })
+        )
+        
+        ;; SELL ORDER
+        (let (
+          (user-shares (get-user-shares (get shares-owned position) outcome-id))
+          (shares-to-sell (min amount user-shares))
+          (payout (/ (* shares-to-sell effective-price) u1000000))
+          (fee-amount (/ (* payout (get creator-fee market)) u10000))
+          (protocol-fee (/ (* payout (var-get base-trading-fee)) u10000))
+          (net-payout (- payout (+ fee-amount protocol-fee)))
+        )
+          ;; Ensure sufficient shares to sell
+          (asserts! (>= user-shares amount) err-shares-not-found)
+          (asserts! (>= net-payout min-shares) err-insufficient-funds) ;; Using min-shares as min-payout
+          
+          ;; Update position
+          (map-set positions-v2
+            { market-id: market-id, user: trader }
+            (merge position {
+              shares-owned: (remove-shares-from-position (get shares-owned position) outcome-id shares-to-sell),
+              realized-pnl: (+ (get realized-pnl position) (calculate-realized-pnl outcome-id shares-to-sell effective-price (get shares-owned position))),
+              last-trade-timestamp: block-height
+            })
+          )
+          
+          ;; Transfer payout to trader
+          (try! (as-contract (transfer-collateral net-payout (as-contract tx-sender) trader (get collateral-token market))))
+          
+          ;; Update market volume and metrics
+          (try! (update-market-metrics market-id payout))
+          
+          ;; Distribute fees
+          (try! (distribute-trading-fees market-id fee-amount protocol-fee))
+          
+          (ok { shares-sold: shares-to-sell, effective-price: effective-price, payout: net-payout })
+        )
+      )
+    )
+  )
+)
+
+;; Calculate AMM price using constant product formula
+(define-private (calculate-amm-price (market-id uint) (outcome-id uint))
+  (let (
+    (market (unwrap-panic (map-get? markets-v2 { market-id: market-id })))
+    (amm-pool (unwrap-panic (map-get? amm-pools { market-id: market-id })))
+    (outcome-count (len (get outcomes market)))
+    (total-liquidity (get total-liquidity market))
+  )
+    ;; Simplified pricing: equal probability starting point with adjustments
+    ;; In production, this would use more sophisticated algorithms
+    (if (> total-liquidity u0)
+      (/ u100000000 outcome-count) ;; Base price of 1/n where n is number of outcomes
+      u50000000) ;; Default 50% probability for binary markets
+  )
+)
+
+;; Calculate price impact based on trade size
+(define-private (calculate-price-impact (market-id uint) (outcome-id uint) (amount uint) (trade-type uint))
+  (let (
+    (market (unwrap-panic (map-get? markets-v2 { market-id: market-id })))
+    (total-liquidity (get total-liquidity market))
+    (impact-factor (get price-impact-factor (unwrap-panic (map-get? amm-pools { market-id: market-id }))))
+  )
+    ;; Calculate price impact: larger trades = more impact
+    (if (> total-liquidity u0)
+      (/ (* amount impact-factor) total-liquidity)
+      u0)
+  )
+)
+
+;; Helper function to calculate absolute difference
+(define-private (abs-diff (a uint) (b uint))
+  (if (> a b) (- a b) (- b a))
+)
+
+;; Helper function to find minimum of two values
+(define-private (min (a uint) (b uint))
+  (if (< a b) a b)
+)
+
+;; Get total position size for a user
+(define-private (get-total-position-size (user principal) (market-id uint))
+  (let (
+    (position (map-get? positions-v2 { market-id: market-id, user: user }))
+  )
+    (match position
+      pos (fold + (map get-shares-value (get shares-owned pos)) u0)
+      u0
+    )
+  )
+)
+
+;; Helper to get shares value from position entry
+(define-private (get-shares-value (entry { outcome-id: uint, shares: uint, avg-price: uint }))
+  (get shares entry)
+)
+
+;; Add shares to existing position
+(define-private (add-shares-to-position 
+  (current-shares (list 20 { outcome-id: uint, shares: uint, avg-price: uint }))
+  (outcome-id uint)
+  (new-shares uint)
+  (price uint))
+  
+  (let (
+    (existing-entry (find-shares-entry current-shares outcome-id))
+  )
+    (match existing-entry
+      entry 
+        ;; Update existing entry with new average price
+        (let (
+          (total-shares (+ (get shares entry) new-shares))
+          (weighted-avg-price (/ (+ (* (get shares entry) (get avg-price entry)) (* new-shares price)) total-shares))
+          (updated-entry { outcome-id: outcome-id, shares: total-shares, avg-price: weighted-avg-price })
+        )
+          (replace-shares-entry current-shares outcome-id updated-entry)
+        )
+      ;; Add new entry
+      (unwrap-panic (as-max-len? (append current-shares { outcome-id: outcome-id, shares: new-shares, avg-price: price }) u20))
+    )
+  )
+)
+
+;; Remove shares from position
+(define-private (remove-shares-from-position
+  (current-shares (list 20 { outcome-id: uint, shares: uint, avg-price: uint }))
+  (outcome-id uint)
+  (shares-to-remove uint))
+  
+  (let (
+    (existing-entry (find-shares-entry current-shares outcome-id))
+  )
+    (match existing-entry
+      entry
+        (let (
+          (remaining-shares (- (get shares entry) shares-to-remove))
+        )
+          (if (> remaining-shares u0)
+            ;; Update entry with remaining shares
+            (replace-shares-entry current-shares outcome-id 
+              { outcome-id: outcome-id, shares: remaining-shares, avg-price: (get avg-price entry) })
+            ;; Remove entry entirely
+            (filter remove-shares-filter current-shares)
+          )
+        )
+      current-shares ;; Entry not found, return unchanged
+    )
+  )
+)
+
+;; Find shares entry by outcome ID
+(define-private (find-shares-entry 
+  (shares (list 20 { outcome-id: uint, shares: uint, avg-price: uint }))
+  (outcome-id uint))
+  
+  (let (
+    (matching-entries (filter shares-matches-outcome shares))
+  )
+    (if (> (len matching-entries) u0)
+      (some (unwrap-panic (element-at matching-entries u0)))
+      none
+    )
+  )
+)
+
+;; Check if shares entry matches outcome
+(define-private (shares-matches-outcome (entry { outcome-id: uint, shares: uint, avg-price: uint }))
+  (is-eq (get outcome-id entry) outcome-id)
+)
+
+;; Filter to remove shares entries
+(define-private (remove-shares-filter (entry { outcome-id: uint, shares: uint, avg-price: uint }))
+  (not (is-eq (get outcome-id entry) outcome-id))
+)
+
+;; Replace shares entry in list
+(define-private (replace-shares-entry
+  (shares (list 20 { outcome-id: uint, shares: uint, avg-price: uint }))
+  (outcome-id uint)
+  (new-entry { outcome-id: uint, shares: uint, avg-price: uint }))
+  
+  (map replace-if-matching shares)
+)
+
+;; Helper for replacing matching entry
+(define-private (replace-if-matching (entry { outcome-id: uint, shares: uint, avg-price: uint }))
+  (if (is-eq (get outcome-id entry) outcome-id)
+    new-entry
+    entry
+  )
+)
+
+;; Get user's shares for specific outcome
+(define-private (get-user-shares 
+  (shares (list 20 { outcome-id: uint, shares: uint, avg-price: uint }))
+  (outcome-id uint))
+  
+  (match (find-shares-entry shares outcome-id)
+    entry (get shares entry)
+    u0
+  )
+)
+
+;; Calculate realized P&L for a trade
+(define-private (calculate-realized-pnl
+  (outcome-id uint)
+  (shares-sold uint)
+  (sell-price uint)
+  (current-shares (list 20 { outcome-id: uint, shares: uint, avg-price: uint })))
+  
+  (match (find-shares-entry current-shares outcome-id)
+    entry 
+      (let (
+        (avg-cost (get avg-price entry))
+        (cost-basis (/ (* shares-sold avg-cost) u1000000))
+        (sale-proceeds (/ (* shares-sold sell-price) u1000000))
+      )
+        (to-int (if (> sale-proceeds cost-basis)
+                   (- sale-proceeds cost-basis)
+                   (- cost-basis sale-proceeds)))
+      )
+    0 ;; No existing position
+  )
+)
+
+;; Transfer collateral token (supports multiple token types)
+(define-private (transfer-collateral (amount uint) (sender principal) (recipient principal) (token-contract principal))
+  ;; For now, assuming STX. In full implementation, this would handle different token contracts
+  (stx-transfer? amount sender recipient)
+)
+
+;; Update market metrics after trading
+(define-private (update-market-metrics (market-id uint) (volume uint))
+  (let (
+    (metrics (default-to {
+      daily-volume: u0,
+      weekly-volume: u0,
+      unique-traders: u0,
+      price-volatility: u0,
+      liquidity-score: u0,
+      last-updated: block-height
+    } (map-get? market-metrics { market-id: market-id })))
+    (amm-pool (unwrap! (map-get? amm-pools { market-id: market-id }) (ok false)))
+  )
+    ;; Update metrics
+    (map-set market-metrics
+      { market-id: market-id }
+      (merge metrics {
+        daily-volume: (+ (get daily-volume metrics) volume),
+        weekly-volume: (+ (get weekly-volume metrics) volume),
+        last-updated: block-height
+      })
+    )
+    
+    ;; Update AMM pool volume
+    (map-set amm-pools
+      { market-id: market-id }
+      (merge amm-pool { volume-24h: (+ (get volume-24h amm-pool) volume) })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Distribute trading fees
+(define-private (distribute-trading-fees (market-id uint) (creator-fee-amount uint) (protocol-fee-amount uint))
+  (let (
+    (market (unwrap! (map-get? markets-v2 { market-id: market-id }) (ok false)))
+    (creator (get creator market))
+  )
+    ;; Pay creator fee
+    (try! (as-contract (stx-transfer? creator-fee-amount (as-contract tx-sender) creator)))
+    
+    ;; Pay protocol fee to contract owner
+    (try! (as-contract (stx-transfer? protocol-fee-amount (as-contract tx-sender) contract-owner)))
+    
+    ;; Update AMM pool fee accumulation
+    (let ((amm-pool (unwrap! (map-get? amm-pools { market-id: market-id }) (ok false))))
+      (map-set amm-pools
+        { market-id: market-id }
+        (merge amm-pool { fee-accumulated: (+ (get fee-accumulated amm-pool) (+ creator-fee-amount protocol-fee-amount)) })
+      )
+    )
+    
+    (ok true)
   )
 ) 
