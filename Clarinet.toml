@@ -8,6 +8,10 @@ requirements = []
 path = "contracts/Prediction_market-platform.clar"
 depends_on = []
 
+[contracts.pred-market-v2]
+path = "contracts/pred-market-v2.clar"
+depends_on = []
+
 [repl]
 costs_version = 2
 parser_version = 2
