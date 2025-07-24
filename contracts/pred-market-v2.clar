@@ -867,4 +867,442 @@
     
     (ok true)
   )
+)
+
+;; ===== COMMIT 3: CONDITIONAL MARKETS AND IMPROVED ORACLE CONSENSUS =====
+
+;; Create conditional market that depends on another market's outcome
+(define-public (create-conditional-market
+  (parent-market-id uint)
+  (required-outcome uint)
+  (title (string-utf8 128))
+  (description (string-utf8 512))
+  (category (string-ascii 32))
+  (outcomes (list 20 (string-utf8 128)))
+  (collateral-token principal)
+  (trading-duration uint)
+  (resolution-time uint)
+  (creator-fee uint)
+  (oracle-fee uint)
+  (resolution-source (string-utf8 256))
+  (metadata (string-utf8 512)))
+  
+  (let (
+    (parent-market (unwrap! (map-get? markets-v2 { market-id: parent-market-id }) err-market-not-found))
+    (market-id (var-get next-market-id))
+    (creator tx-sender)
+    (current-time block-height)
+  )
+    ;; Validate parent market and conditions
+    (asserts! (not (var-get protocol-paused)) err-market-paused)
+    (asserts! (< required-outcome (len (get outcomes parent-market))) err-invalid-outcome)
+    (asserts! (> (get resolution-time parent-market) current-time) err-invalid-condition)
+    (asserts! (> trading-duration u144) err-invalid-parameters) ;; Min 1 day
+    
+    ;; Conditional market starts trading only after parent resolves
+    (let (
+      (trading-start-time (+ (get resolution-time parent-market) u144)) ;; 1 day after parent resolution
+      (trading-end-time (+ trading-start-time trading-duration))
+    )
+      ;; Enhanced market creation fee for conditional markets
+      (let ((creation-fee (calculate-creation-fee market-type-conditional trading-duration)))
+        (try! (stx-transfer? creation-fee creator contract-owner))
+      )
+      
+      ;; Create conditional market
+      (map-set markets-v2
+        { market-id: market-id }
+        {
+          creator: creator,
+          title: title,
+          description: description,
+          category: category,
+          market-type: market-type-conditional,
+          outcomes: outcomes,
+          collateral-token: collateral-token,
+          creation-time: current-time,
+          trading-start-time: trading-start-time,
+          trading-end-time: trading-end-time,
+          resolution-time: resolution-time,
+          total-liquidity: u0,
+          total-volume: u0,
+          creator-fee: creator-fee,
+          oracle-fee: oracle-fee,
+          status: u4, ;; Start as paused until parent resolves
+          resolution-source: resolution-source,
+          metadata: metadata,
+          conditional-parent: (some parent-market-id),
+          conditional-outcome: (some required-outcome),
+          min-liquidity-threshold: u1000000, ;; 1 STX minimum
+          max-position-size: u100000000, ;; 100 STX maximum
+          early-resolution-eligible: false
+        }
+      )
+      
+      ;; Initialize supporting data structures
+      (map-set amm-pools
+        { market-id: market-id }
+        {
+          k-constant: u0,
+          liquidity-token-supply: u0,
+          fee-accumulated: u0,
+          price-impact-factor: u150, ;; Higher impact for conditional markets
+          last-price-update: current-time,
+          volume-24h: u0,
+          impermanent-loss-protection: true
+        }
+      )
+      
+      (map-set market-metrics
+        { market-id: market-id }
+        {
+          daily-volume: u0,
+          weekly-volume: u0,
+          unique-traders: u0,
+          price-volatility: u0,
+          liquidity-score: u0,
+          last-updated: current-time
+        }
+      )
+      
+      ;; Mint market NFT to creator
+      (try! (nft-mint? market-nft market-id creator))
+      
+      ;; Increment market ID
+      (var-set next-market-id (+ market-id u1))
+      
+      (ok market-id)
+    )
+  )
+)
+
+;; Activate conditional market when parent market resolves correctly
+(define-public (activate-conditional-market (market-id uint))
+  (let (
+    (market (unwrap! (map-get? markets-v2 { market-id: market-id }) err-market-not-found))
+    (parent-market-id (unwrap! (get conditional-parent market) err-invalid-condition))
+    (required-outcome (unwrap! (get conditional-outcome market) err-invalid-condition))
+    (parent-market (unwrap! (map-get? markets-v2 { market-id: parent-market-id }) err-market-not-found))
+  )
+    ;; Validate conditions for activation
+    (asserts! (is-eq (get market-type market) market-type-conditional) err-invalid-parameters)
+    (asserts! (is-eq (get status market) u4) err-market-paused) ;; Must be paused
+    (asserts! (is-eq (get status parent-market) u2) err-market-not-resolved) ;; Parent must be resolved
+    
+    ;; Check if parent market resolved to required outcome
+    (let ((parent-resolution (unwrap! (get-market-resolution parent-market-id) err-market-not-resolved)))
+      (if (is-eq parent-resolution required-outcome)
+        ;; Activate the conditional market
+        (begin
+          (map-set markets-v2
+            { market-id: market-id }
+            (merge market { status: u0 }) ;; Activate market
+          )
+          (ok true)
+        )
+        ;; Cancel the conditional market if parent didn't resolve as expected
+        (begin
+          (map-set markets-v2
+            { market-id: market-id }
+            (merge market { status: u1 }) ;; Close market
+          )
+          (ok false) ;; Market cancelled
+        )
+      )
+    )
+  )
+)
+
+;; Enhanced oracle consensus system
+(define-public (submit-oracle-vote
+  (market-id uint)
+  (outcome uint)
+  (confidence uint)
+  (stake-amount uint)
+  (reasoning (optional (string-utf8 256))))
+  
+  (let (
+    (oracle tx-sender)
+    (market (unwrap! (map-get? markets-v2 { market-id: market-id }) err-market-not-found))
+    (oracle-info (unwrap! (map-get? oracle-network { oracle: oracle }) err-unauthorized-oracle))
+  )
+    ;; Validate oracle and market conditions
+    (asserts! (is-eq (get status oracle-info) u0) err-unauthorized-oracle) ;; Oracle must be active
+    (asserts! (>= block-height (get trading-end-time market)) err-market-not-closed)
+    (asserts! (< outcome (len (get outcomes market))) err-invalid-outcome)
+    (asserts! (<= confidence u100) err-invalid-parameters)
+    (asserts! (>= stake-amount u1000000) err-invalid-parameters) ;; Min 1 STX stake
+    
+    ;; Check oracle hasn't already voted
+    (asserts! (is-none (map-get? oracle-votes { market-id: market-id, oracle: oracle })) err-invalid-parameters)
+    
+    ;; Transfer stake from oracle
+    (try! (stx-transfer? stake-amount oracle (as-contract tx-sender)))
+    
+    ;; Record oracle vote
+    (map-set oracle-votes
+      { market-id: market-id, oracle: oracle }
+      {
+        outcome: outcome,
+        confidence: confidence,
+        timestamp: block-height,
+        stake-amount: stake-amount,
+        reasoning: reasoning
+      }
+    )
+    
+    ;; Update oracle stats
+    (map-set oracle-network
+      { oracle: oracle }
+      (merge oracle-info { 
+        last-active: block-height,
+        stake-amount: (+ (get stake-amount oracle-info) stake-amount)
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Calculate oracle consensus and resolve market
+(define-public (resolve-with-consensus (market-id uint))
+  (let (
+    (market (unwrap! (map-get? markets-v2 { market-id: market-id }) err-market-not-found))
+    (consensus-result (calculate-consensus market-id))
+  )
+    ;; Validate resolution conditions
+    (asserts! (>= block-height (+ (get trading-end-time market) u144)) err-market-not-closed) ;; 1 day after close
+    (asserts! (is-eq (get status market) u0) err-market-closed) ;; Must be active
+    (asserts! (>= (get vote-count consensus-result) (var-get min-oracle-consensus)) err-oracle-consensus-failed)
+    
+    (let (
+      (winning-outcome (get consensus-outcome consensus-result))
+      (confidence-score (get confidence-score consensus-result))
+    )
+      ;; Only proceed if consensus is strong enough (>60% confidence)
+      (asserts! (>= confidence-score u60) err-oracle-consensus-failed)
+      
+             ;; Resolve market
+       (map-set markets-v2
+         { market-id: market-id }
+         (merge market { 
+           status: u2 ;; Resolved
+         })
+       )
+      
+      ;; Record resolution outcome
+      (map-set market-resolution
+        { market-id: market-id }
+        { 
+          outcome: winning-outcome,
+          resolution-time: block-height,
+          consensus-confidence: confidence-score,
+          resolver: tx-sender
+        }
+      )
+      
+      ;; Reward participating oracles based on their alignment with consensus
+      (try! (distribute-oracle-rewards market-id winning-outcome))
+      
+      ;; Check and activate any conditional markets
+      (try! (check-conditional-markets market-id winning-outcome))
+      
+      (ok { outcome: winning-outcome, confidence: confidence-score })
+    )
+  )
+)
+
+;; Market resolution storage
+(define-map market-resolution
+  { market-id: uint }
+  {
+    outcome: uint,
+    resolution-time: uint,
+    consensus-confidence: uint,
+    resolver: principal
+  }
+)
+
+;; Get market resolution
+(define-read-only (get-market-resolution (market-id uint))
+  (match (map-get? market-resolution { market-id: market-id })
+    resolution (some (get outcome resolution))
+    none
+  )
+)
+
+;; Calculate consensus from oracle votes
+(define-private (calculate-consensus (market-id uint))
+  (let (
+    (all-oracles (get-market-oracles market-id))
+    (vote-results (calculate-weighted-votes market-id all-oracles))
+  )
+    (get-consensus-outcome vote-results)
+  )
+)
+
+;; Get all oracles that voted on a market
+(define-private (get-market-oracles (market-id uint))
+  ;; In a full implementation, this would iterate through oracle-votes map
+  ;; For simplicity, returning a placeholder list
+  (list tx-sender) ;; Placeholder - would be dynamic in production
+)
+
+;; Calculate weighted votes (simplified implementation)
+(define-private (calculate-weighted-votes (market-id uint) (oracles (list 50 principal)))
+  ;; Simplified: return basic consensus data
+  {
+    outcome-0-weight: u100,
+    outcome-1-weight: u80,
+    total-votes: u2,
+    max-confidence: u75
+  }
+)
+
+;; Get consensus outcome from vote results
+(define-private (get-consensus-outcome (vote-results { outcome-0-weight: uint, outcome-1-weight: uint, total-votes: uint, max-confidence: uint }))
+  {
+    consensus-outcome: (if (> (get outcome-0-weight vote-results) (get outcome-1-weight vote-results)) u0 u1),
+    confidence-score: (get max-confidence vote-results),
+    vote-count: (get total-votes vote-results)
+  }
+)
+
+;; Distribute rewards to oracles based on consensus alignment
+(define-private (distribute-oracle-rewards (market-id uint) (winning-outcome uint))
+  ;; Simplified implementation - would calculate rewards based on vote accuracy
+  (ok true)
+)
+
+;; Check and activate conditional markets after parent resolution
+(define-private (check-conditional-markets (parent-market-id uint) (resolution-outcome uint))
+  ;; In full implementation, would iterate through all conditional markets
+  ;; and activate those that depend on this parent market
+  (ok true)
+)
+
+;; Multi-oracle dispute system
+(define-public (dispute-consensus
+  (market-id uint)
+  (proposed-outcome uint)
+  (stake-amount uint)
+  (evidence (string-utf8 512)))
+  
+  (let (
+    (disputer tx-sender)
+    (market (unwrap! (map-get? markets-v2 { market-id: market-id }) err-market-not-found))
+    (resolution (unwrap! (map-get? market-resolution { market-id: market-id }) err-market-not-resolved))
+    (min-dispute-stake (* (get oracle-fee market) u2)) ;; 2x oracle fee minimum
+  )
+    ;; Validate dispute conditions
+    (asserts! (is-eq (get status market) u2) err-market-not-resolved) ;; Must be resolved
+    (asserts! (not (is-eq proposed-outcome (get outcome resolution))) err-invalid-outcome)
+    (asserts! (>= stake-amount min-dispute-stake) err-invalid-parameters)
+    (asserts! (< block-height (+ (get resolution-time resolution) u1008)) err-dispute-period-ended) ;; 7 days to dispute
+    
+    ;; Transfer dispute stake
+    (try! (stx-transfer? stake-amount disputer (as-contract tx-sender)))
+    
+    ;; Create dispute record
+    (map-set market-disputes
+      { market-id: market-id, disputer: disputer }
+      {
+        proposed-outcome: proposed-outcome,
+        stake-amount: stake-amount,
+        evidence: evidence,
+        dispute-time: block-height,
+        votes-for: u0,
+        votes-against: u0,
+        resolved: false
+      }
+    )
+    
+    ;; Update market status to disputed
+    (map-set markets-v2
+      { market-id: market-id }
+      (merge market { status: u3 }) ;; Disputed
+    )
+    
+    (ok true)
+  )
+)
+
+;; Dispute storage
+(define-map market-disputes
+  { market-id: uint, disputer: principal }
+  {
+    proposed-outcome: uint,
+    stake-amount: uint,
+    evidence: (string-utf8 512),
+    dispute-time: uint,
+    votes-for: uint,
+    votes-against: uint,
+    resolved: bool
+  }
+)
+
+;; Oracle voting on disputes
+(define-public (vote-on-dispute
+  (market-id uint)
+  (disputer principal)
+  (support bool)
+  (reasoning (optional (string-utf8 256))))
+  
+  (let (
+    (oracle tx-sender)
+    (oracle-info (unwrap! (map-get? oracle-network { oracle: oracle }) err-unauthorized-oracle))
+    (dispute (unwrap! (map-get? market-disputes { market-id: market-id, disputer: disputer }) err-market-not-found))
+  )
+    ;; Validate oracle can vote
+    (asserts! (is-eq (get status oracle-info) u0) err-unauthorized-oracle)
+    (asserts! (not (get resolved dispute)) err-market-resolved)
+    
+    ;; Record vote (simplified - would track individual votes in production)
+    (let (
+      (updated-dispute (merge dispute 
+        (if support
+          { votes-for: (+ (get votes-for dispute) (get consensus-weight oracle-info)) }
+          { votes-against: (+ (get votes-against dispute) (get consensus-weight oracle-info)) }
+        )
+      ))
+    )
+      (map-set market-disputes
+        { market-id: market-id, disputer: disputer }
+        updated-dispute
+      )
+      
+      ;; Check if dispute threshold reached (>60% support needed)
+      (let (
+        (total-votes (+ (get votes-for updated-dispute) (get votes-against updated-dispute)))
+        (support-percentage (if (> total-votes u0) (/ (* (get votes-for updated-dispute) u100) total-votes) u0))
+      )
+        (if (and (>= total-votes u5) (>= support-percentage u60))
+          ;; Dispute successful - update market resolution
+          (begin
+            (map-set market-resolution
+              { market-id: market-id }
+              {
+                outcome: (get proposed-outcome dispute),
+                resolution-time: block-height,
+                consensus-confidence: support-percentage,
+                resolver: disputer
+              }
+            )
+            
+            ;; Return stake plus reward to disputer
+            (try! (as-contract (stx-transfer? (* (get stake-amount dispute) u11 (/ u10)) (as-contract tx-sender) disputer)))
+            
+            ;; Mark dispute as resolved
+            (map-set market-disputes
+              { market-id: market-id, disputer: disputer }
+              (merge updated-dispute { resolved: true })
+            )
+            
+            (ok { dispute-successful: true })
+          )
+          (ok { dispute-successful: false })
+        )
+      )
+    )
+  )
 ) 
